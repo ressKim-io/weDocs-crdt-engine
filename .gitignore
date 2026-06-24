@@ -1,0 +1,11 @@
+# Rust build
+/target
+
+# proto는 controller SSOT에서 vendoring (make proto-sync) — 커밋하지 않음
+/proto
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp

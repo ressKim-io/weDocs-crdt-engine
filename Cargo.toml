@@ -1,0 +1,35 @@
+[package]
+name = "wedocs-crdt-engine"
+version = "0.1.0"
+edition = "2024"
+description = "weDocs CRDT engine — yrs CRDT merge over tonic gRPC bidi stream"
+license = "MIT"
+publish = false
+
+[lib]
+name = "wedocs_crdt_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wedocs-crdt-engine"
+path = "src/main.rs"
+
+[dependencies]
+yrs = "0.27"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal"] }
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+proptest = "1"
+criterion = "0.8"
+
+[[bench]]
+name = "convergence"
+harness = false
