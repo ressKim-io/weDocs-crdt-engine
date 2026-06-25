@@ -27,8 +27,8 @@ fn bench_merge(c: &mut Criterion) {
 
     c.bench_function("apply_256_concurrent_updates", |b| {
         b.iter(|| {
+            // apply_update가 update에서 "doc" 텍스트 타입을 정의 → 사전 등록 불필요.
             let doc = Doc::new();
-            let _text = doc.get_or_insert_text("doc");
             for bytes in &updates {
                 let update = Update::decode_v1(bytes).unwrap();
                 doc.transact_mut().apply_update(update).unwrap();

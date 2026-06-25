@@ -1,7 +1,7 @@
 //! 엔진 fan-out 통합 테스트 — gRPC 전송 없이 `DocRegistry` 핵심 경로 검증.
 //! (gRPC end-to-end는 Phase 3 프론트 E2E에서 실제 게이트웨이로 검증.)
 
-use wedocs_crdt_engine::engine::DocRegistry;
+use wedocs_crdt_engine::engine::{DocRegistry, EngineError};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
@@ -47,7 +47,10 @@ async fn diff_returns_full_state_for_empty_state_vector() {
     let doc_id = "room-2";
     registry.open(doc_id).await;
 
-    registry.apply_v1(doc_id, &insert_update('y')).await.unwrap();
+    registry
+        .apply_v1(doc_id, &insert_update('y'))
+        .await
+        .unwrap();
 
     // 빈 state vector → 전체 상태 diff. 적용 시 'y' 복원.
     let empty_sv = StateVector::default().encode_v1();
@@ -61,7 +64,13 @@ async fn corrupt_update_is_rejected_not_panicked() {
     let doc_id = "room-3";
     registry.open(doc_id).await;
 
-    // 손상된 v1 바이트 → Err(Codec), 패닉 금지.
-    let err = registry.apply_v1(doc_id, &[0xff, 0xff, 0xff]).await;
-    assert!(err.is_err());
+    // 손상된 v1 바이트 → Err(Codec) 구체 변종, 패닉 금지.
+    let err = registry
+        .apply_v1(doc_id, &[0xff, 0xff, 0xff])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Codec(_)),
+        "expected Codec, got {err:?}"
+    );
 }

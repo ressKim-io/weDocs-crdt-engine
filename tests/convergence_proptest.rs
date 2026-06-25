@@ -23,7 +23,9 @@ fn apply_in_order(updates: &[Vec<u8>]) -> String {
     let text = doc.get_or_insert_text("doc");
     for bytes in updates {
         let update = Update::decode_v1(bytes).expect("v1 decode");
-        doc.transact_mut().apply_update(update).expect("apply_update");
+        doc.transact_mut()
+            .apply_update(update)
+            .expect("apply_update");
     }
     text.get_string(&doc.transact())
 }
