@@ -12,7 +12,9 @@ use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
-/// fan-out 채널 용량. 느린 수신자가 이만큼 밀리면 `Lagged` → 서비스 계층이 full resync(§D-5).
+/// per-doc broadcast 채널 용량. per-session 아웃바운드 버퍼(`service::OUTBOUND_BUFFER`=64)보다
+/// 크게 잡아, 느린 소비자가 broadcast `Lagged`(→ full resync, §D-5)를 트리거하기 전에
+/// 아웃바운드 mpsc에서 먼저 자연 백프레셔가 걸리도록 의도.
 const FANOUT_CAPACITY: usize = 256;
 
 /// 엔진 경계 에러. yrs 내부 에러 타입을 메시지로 흡수해 상위(tonic)에서 `Status`로 매핑.
@@ -110,18 +112,22 @@ impl DocRegistry {
             .get(doc_id)
             .ok_or_else(|| EngineError::UnknownDoc(doc_id.to_string()))?;
 
-        let sv = StateVector::decode_v1(client_sv).map_err(|e| EngineError::Codec(e.to_string()))?;
+        let sv =
+            StateVector::decode_v1(client_sv).map_err(|e| EngineError::Codec(e.to_string()))?;
         Ok(entry.doc.transact().encode_state_as_update_v1(&sv))
     }
 
-    /// 전체 상태(v1) — Lagged resync(§D-5) / `GetSnapshot` 복원용. 없으면 생성.
+    /// 전체 상태(v1) — Lagged resync(§D-5) / `GetSnapshot` 복원용.
+    /// 존재하지 않는 doc는 빈 바이트 — 조회가 빈 Doc를 생성하는 부작용을 두지 않는다.
+    /// (Lagged resync 경로는 항상 open 이후라 `None`이 아니다.)
     pub async fn full_state_v1(&self, doc_id: &str) -> Vec<u8> {
-        let mut docs = self.docs.lock().await;
-        let entry = docs.entry(doc_id.to_string()).or_insert_with(DocEntry::new);
-        entry
-            .doc
-            .transact()
-            .encode_state_as_update_v1(&StateVector::default())
+        let docs = self.docs.lock().await;
+        docs.get(doc_id).map_or_else(Vec::new, |entry| {
+            entry
+                .doc
+                .transact()
+                .encode_state_as_update_v1(&StateVector::default())
+        })
     }
 
     /// 현재 보유 중인 문서 수(디버그/관측용).
