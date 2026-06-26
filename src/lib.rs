@@ -1,8 +1,8 @@
 //! weDocs CRDT 엔진 — yrs 머지 + tonic gRPC(bidi `Sync`).
 //!
-//! M1 골격: 빌드 배선(proto codegen · tonic 서비스 트레이트 · yrs 의존)을 확립한다.
-//! 실제 수렴 로직(`apply_update`/`encode_state`/fan-out)과 proptest 수렴 통과는
-//! M1 본 구현에서 채운다 — 가드레일: 머지 전 commutative/associative/idempotent 통과.
+//! M1 본 구현: docId별 yrs 권위 머지(`engine::DocRegistry`) + broadcast fan-out,
+//! gRPC bidi 브리지(`service`). 모든 인코딩은 lib0 v1(Yjs 호환) 고정.
+//! 가드레일: 수렴(commutative/idempotent)은 `tests/convergence_proptest.rs`에서 증명.
 
 // proto SSOT(controller) → tonic-prost-build 생성물. 패키지별 모듈.
 // crdt.proto가 common.proto를 import → crdt 모듈 내부에서 `super::common` 참조.
