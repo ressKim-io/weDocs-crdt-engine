@@ -5,11 +5,15 @@
 
 use std::pin::Pin;
 
+use opentelemetry::propagation::Extractor;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::{KeyRef, MetadataMap};
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::common::DocRef;
 use crate::crdt::crdt_engine_server::CrdtEngine;
@@ -25,6 +29,26 @@ const OUTBOUND_BUFFER: usize = 64;
 
 /// 송신 채널 타입 — 한 세션의 아웃바운드 프레임.
 type Outbound = mpsc::Sender<Result<ServerFrame, Status>>;
+
+/// tonic `MetadataMap`을 OTel propagator가 읽도록 어댑트 — 게이트웨이가 주입한 W3C
+/// `traceparent`(가드레일 4) 추출용. binary 메타데이터는 텍스트 컨텍스트가 아니므로 건너뛴다.
+struct MetadataExtractor<'a>(&'a MetadataMap);
+
+impl Extractor for MetadataExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0
+            .keys()
+            .filter_map(|key| match key {
+                KeyRef::Ascii(key) => Some(key.as_str()),
+                KeyRef::Binary(_) => None,
+            })
+            .collect()
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct CrdtEngineService {
@@ -47,12 +71,25 @@ impl CrdtEngine for CrdtEngineService {
         &self,
         request: Request<Streaming<ClientFrame>>,
     ) -> Result<Response<Self::SyncStream>, Status> {
+        // 게이트웨이(Java javaagent)가 gRPC 메타데이터에 주입한 W3C traceparent를 추출(가드레일 4).
+        // bidi 스트림이라 stream-open 1회 전파 — 이 세션 전체가 게이트웨이 span의 자식.
+        // (per-edit 메시지 span은 proto field/수동 전파 필요 → M1.5/M5.)
+        let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&MetadataExtractor(request.metadata()))
+        });
+
         let doc_id = request
             .metadata()
             .get("doc-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
             .ok_or_else(|| Status::invalid_argument("missing doc-id metadata"))?;
+
+        let span = tracing::info_span!("crdt.sync", doc_id = %doc_id);
+        // OTel 레이어 부재(degraded/test)면 Err — trace 연결만 생략, 세션은 정상.
+        if let Err(error) = span.set_parent(parent_cx) {
+            tracing::debug!(error = %error, "trace parent 미설정(OTel 레이어 부재)");
+        }
 
         let mut inbound = request.into_inner();
         let registry = self.registry.clone();
@@ -61,41 +98,45 @@ impl CrdtEngine for CrdtEngineService {
 
         let (out_tx, out_rx) = mpsc::channel::<Result<ServerFrame, Status>>(OUTBOUND_BUFFER);
 
-        tokio::spawn(async move {
-            // 엔진 → 클라 SyncStep1: 클라가 가진 오프라인분을 pull하게 한다.
-            let step1 = ServerFrame {
-                update: Vec::new(),
-                state_vector: subscription.state_vector,
-            };
-            if out_tx.send(Ok(step1)).await.is_err() {
-                return;
-            }
+        // `.instrument(span)` — 세션 태스크 전체를 trace span으로 감싸 내부 로그가 trace에 연결.
+        tokio::spawn(
+            async move {
+                // 엔진 → 클라 SyncStep1: 클라가 가진 오프라인분을 pull하게 한다.
+                let step1 = ServerFrame {
+                    update: Vec::new(),
+                    state_vector: subscription.state_vector,
+                };
+                if out_tx.send(Ok(step1)).await.is_err() {
+                    return;
+                }
 
-            // cancel-safety: `inbound.message()`의 디코드 상태는 `Streaming`에 보존되고
-            // broadcast `recv()`는 문서상 cancel-safe → 어느 select 브랜치가 취소돼도 프레임 무손실.
-            // (config-contract-audit: tonic 마이너 업그레이드 시 재확인.)
-            loop {
-                tokio::select! {
-                    incoming = inbound.message() => match incoming {
-                        Ok(Some(frame)) => {
-                            if !handle_inbound(&registry, &doc_id, frame, &out_tx).await {
+                // cancel-safety: `inbound.message()`의 디코드 상태는 `Streaming`에 보존되고
+                // broadcast `recv()`는 문서상 cancel-safe → 어느 select 브랜치가 취소돼도 프레임 무손실.
+                // (config-contract-audit: tonic 마이너 업그레이드 시 재확인.)
+                loop {
+                    tokio::select! {
+                        incoming = inbound.message() => match incoming {
+                            Ok(Some(frame)) => {
+                                if !handle_inbound(&registry, &doc_id, frame, &out_tx).await {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break, // 클라 정상 종료
+                            Err(status) => {
+                                tracing::warn!(%doc_id, %status, "inbound stream error");
                                 break;
                             }
-                        }
-                        Ok(None) => break, // 클라 정상 종료
-                        Err(status) => {
-                            eprintln!("inbound stream error doc={doc_id}: {status}");
-                            break;
-                        }
-                    },
-                    received = fanout.recv() => {
-                        if !handle_broadcast(&registry, &doc_id, received, &out_tx).await {
-                            break;
+                        },
+                        received = fanout.recv() => {
+                            if !handle_broadcast(&registry, &doc_id, received, &out_tx).await {
+                                break;
+                            }
                         }
                     }
                 }
             }
-        });
+            .instrument(span),
+        );
 
         Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
     }
@@ -139,17 +180,15 @@ async fn handle_inbound(
                     return false;
                 }
             }
-            // TODO(M1.5): eprintln → tracing::warn!(doc_id, %e)
-            Err(e) => eprintln!("diff_v1 failed doc={doc_id}: {e}"),
+            Err(e) => tracing::warn!(%doc_id, error = %e, "diff_v1 failed"),
         }
     }
 
     // 클라 update → 머지 + broadcast. 손상 프레임은 로그만, 스트림/타 클라 유지.
-    // TODO(M1.5): eprintln → tracing::warn!(doc_id, %e)
     if !frame.update.is_empty()
         && let Err(e) = registry.apply_v1(doc_id, &frame.update).await
     {
-        eprintln!("apply_v1 failed doc={doc_id}: {e}");
+        tracing::warn!(%doc_id, error = %e, "apply_v1 failed");
     }
 
     true
@@ -173,7 +212,7 @@ async fn handle_broadcast(
         // §D-5: 유실분 복구 불가 → 전체 상태 재전송으로 재수렴.
         Err(RecvError::Lagged(skipped)) => {
             // TODO(M1.5): lagged 빈발 시 cap 부족 신호 → metric(lagged_total)
-            eprintln!("fan-out lagged doc={doc_id} skipped={skipped}; resyncing");
+            tracing::warn!(%doc_id, skipped, "fan-out lagged; resyncing");
             let full = registry.full_state_v1(doc_id).await;
             let frame = ServerFrame {
                 update: full,

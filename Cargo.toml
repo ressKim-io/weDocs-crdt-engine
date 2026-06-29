@@ -21,6 +21,13 @@ tonic-prost = "0.14"
 prost = "0.14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal"] }
 tokio-stream = "0.1"
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+opentelemetry-stdout = "0.32"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.33"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

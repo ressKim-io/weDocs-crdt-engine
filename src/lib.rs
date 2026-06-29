@@ -15,3 +15,4 @@ pub mod crdt {
 
 pub mod engine;
 pub mod service;
+pub mod telemetry;
