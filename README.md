@@ -26,7 +26,15 @@ make check          # proto-sync + cargo check
 make build          # proto-sync + cargo build
 make test           # proptest 수렴 골격
 make run            # 0.0.0.0:50051 (ENGINE_ADDR 로 변경)
+make bench          # 머지 마이크로벤치(Tier1, criterion)
+make bench-baseline # main 기준 저장 (회귀 가드)
+make bench-compare  # main 대비 회귀 감지 (PR)
 ```
+
+## 설계 문서 (controller SSOT)
+엔진의 정체·동시성 모델·최적화 로드맵·벤치 방법론은 controller 레포에 통합 기록.
+- [엔진 기술 설계서](https://github.com/ressKim-io/weDocs-controller/blob/main/docs/design/crdt-engine.md) — 서버 권위 Yjs relay 정체, 동시성/백프레셔, 최적화 로드맵.
+- [벤치마크 방법론](https://github.com/ressKim-io/weDocs-controller/blob/main/docs/design/benchmark-methodology.md) — 3계층 측정·정직한 baseline·측정 위생(이 레포 `benches/` 근거).
 
 ## 가드레일 (SDD §14)
 - 엔진은 "엔진"이다 — 단순 yrs 래퍼 PR 반려, **최적화 + criterion 벤치** 동반.
