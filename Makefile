@@ -2,7 +2,7 @@
 # 로컬 개발 = 로컬 경로(기본), CI/재현 = 원격 git input(태그 핀, ADR-0010).
 CONTROLLER ?= ../weDocs-controller/proto
 
-.PHONY: proto-sync build check test bench run clean
+.PHONY: proto-sync build check test bench bench-baseline bench-compare run clean
 
 proto-sync:
 	rm -rf proto
@@ -21,6 +21,13 @@ test: proto-sync
 
 bench: proto-sync
 	cargo bench
+
+# 회귀 가드(가드레일 5, 방법론 §4): main에서 기준 저장 → PR에서 대비 비교.
+bench-baseline: proto-sync
+	cargo bench -- --save-baseline main
+
+bench-compare: proto-sync
+	cargo bench -- --baseline main
 
 run: proto-sync
 	cargo run
