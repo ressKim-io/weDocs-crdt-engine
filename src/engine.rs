@@ -3,6 +3,7 @@
 //! 전제: 같은 docId = 같은 엔진 인스턴스(Istio waypoint consistent-hash) → 인메모리 머지로 충분.
 //! 모든 인코딩은 lib0 **v1**(Yjs 호환) 고정 — v2 사용 시 브라우저 클라가 디코드 불가.
 
+use std::fmt;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -11,6 +12,41 @@ use tokio::sync::broadcast;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
+
+/// docId 도메인 식별자 — raw `String` 남용(primitive obsession, layering-readability.md P3) 방지.
+/// 검증 로직 없이 순수 wrap만 한다(과잉설계 금지) — 필요해지면 그때 추가.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DocId(String);
+
+impl DocId {
+    /// 참조 접근(할당 없음) — 로깅/비교 등에 사용.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// 소유권 반환 — proto 응답 필드(`doc_id: String`) 구성 등 경계 unwrap 전용.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for DocId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for DocId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for DocId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
 
 /// per-doc broadcast 채널 용량. per-session 아웃바운드 버퍼(`service::OUTBOUND_BUFFER`=64)보다
 /// 크게 잡아, 느린 소비자가 broadcast `Lagged`(→ full resync, §D-5)를 트리거하기 전에
@@ -56,7 +92,7 @@ pub struct Subscription {
 /// 두 락 모두 임계구역 안에 `.await` 없음(yrs `transact()`는 동기) → 동기락이 옳다(concurrency.md P5).
 #[derive(Clone, Default)]
 pub struct DocRegistry {
-    docs: Arc<DashMap<String, Arc<Mutex<DocEntry>>>>,
+    docs: Arc<DashMap<DocId, Arc<Mutex<DocEntry>>>>,
 }
 
 impl DocRegistry {
@@ -70,10 +106,10 @@ impl DocRegistry {
     /// 2단계 락: (1) DashMap 샤드 가드로 `Arc<Mutex<DocEntry>>` 핸들을 얻어 즉시 clone·drop(짧음),
     /// (2) 그 핸들의 문서별 락으로 subscribe+snapshot을 원자적으로 수행. 다른 문서의 동시 open은
     /// 영향받지 않는다 — 이 문서만 잠근다. (샤드 가드를 임계구역 동안 붙들면 샤딩이 무력화되므로 금지.)
-    pub fn open(&self, doc_id: &str) -> Subscription {
+    pub fn open(&self, doc_id: &DocId) -> Subscription {
         let handle = self
             .docs
-            .entry(doc_id.to_string())
+            .entry(doc_id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(DocEntry::new())))
             .value()
             .clone(); // Arc::clone — DashMap 샤드 가드는 이 문장 끝에서 drop
@@ -88,7 +124,7 @@ impl DocRegistry {
 
     /// 인바운드 v1 update를 머지하고, **원본 바이트 그대로** 구독자에게 broadcast.
     /// (yrs 멱등·교환 → 재인코딩 불필요. self-echo는 클라에서 no-op, §D-3.)
-    pub fn apply_v1(&self, doc_id: &str, update: &[u8]) -> Result<(), EngineError> {
+    pub fn apply_v1(&self, doc_id: &DocId, update: &[u8]) -> Result<(), EngineError> {
         let handle = self
             .docs
             .get(doc_id)
@@ -110,7 +146,7 @@ impl DocRegistry {
     }
 
     /// 클라 state vector(v1)를 받아 클라가 누락한 diff(SyncStep2)를 계산.
-    pub fn diff_v1(&self, doc_id: &str, client_sv: &[u8]) -> Result<Vec<u8>, EngineError> {
+    pub fn diff_v1(&self, doc_id: &DocId, client_sv: &[u8]) -> Result<Vec<u8>, EngineError> {
         let handle = self
             .docs
             .get(doc_id)
@@ -127,7 +163,7 @@ impl DocRegistry {
     /// 전체 상태(v1) — Lagged resync(§D-5) / `GetSnapshot` 복원용.
     /// 존재하지 않는 doc는 빈 바이트 — 조회가 빈 Doc를 생성하는 부작용을 두지 않는다.
     /// (Lagged resync 경로는 항상 open 이후라 `None`이 아니다.)
-    pub fn full_state_v1(&self, doc_id: &str) -> Vec<u8> {
+    pub fn full_state_v1(&self, doc_id: &DocId) -> Vec<u8> {
         let Some(handle) = self.docs.get(doc_id).map(|r| r.value().clone()) else {
             return Vec::new();
         };

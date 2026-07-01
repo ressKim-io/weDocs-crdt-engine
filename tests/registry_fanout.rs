@@ -1,7 +1,7 @@
 //! 엔진 fan-out 통합 테스트 — gRPC 전송 없이 `DocRegistry` 핵심 경로 검증.
 //! (gRPC end-to-end는 Phase 3 프론트 E2E에서 실제 게이트웨이로 검증.)
 
-use wedocs_crdt_engine::engine::{DocRegistry, EngineError};
+use wedocs_crdt_engine::engine::{DocId, DocRegistry, EngineError};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
@@ -26,15 +26,15 @@ fn text_of(update: &[u8]) -> String {
 #[tokio::test]
 async fn fanout_delivers_update_to_all_subscribers() {
     let registry = DocRegistry::new();
-    let doc_id = "room-1";
+    let doc_id = DocId::from("room-1");
 
     // 두 세션(두 브라우저) open → 각자 구독.
-    let mut a = registry.open(doc_id);
-    let mut b = registry.open(doc_id);
+    let mut a = registry.open(&doc_id);
+    let mut b = registry.open(&doc_id);
 
     // 세션 A가 'x' update 전송 → 머지 + broadcast.
     let ux = insert_update('x');
-    registry.apply_v1(doc_id, &ux).unwrap();
+    registry.apply_v1(&doc_id, &ux).unwrap();
 
     // 양쪽 수신기 모두 동일 바이트 수신(self-echo 포함, §D-3).
     assert_eq!(a.receiver.recv().await.unwrap(), ux);
@@ -44,25 +44,25 @@ async fn fanout_delivers_update_to_all_subscribers() {
 #[tokio::test]
 async fn diff_returns_full_state_for_empty_state_vector() {
     let registry = DocRegistry::new();
-    let doc_id = "room-2";
-    registry.open(doc_id);
+    let doc_id = DocId::from("room-2");
+    registry.open(&doc_id);
 
-    registry.apply_v1(doc_id, &insert_update('y')).unwrap();
+    registry.apply_v1(&doc_id, &insert_update('y')).unwrap();
 
     // 빈 state vector → 전체 상태 diff. 적용 시 'y' 복원.
     let empty_sv = StateVector::default().encode_v1();
-    let snapshot = registry.diff_v1(doc_id, &empty_sv).unwrap();
+    let snapshot = registry.diff_v1(&doc_id, &empty_sv).unwrap();
     assert_eq!(text_of(&snapshot), "y");
 }
 
 #[tokio::test]
 async fn corrupt_update_is_rejected_not_panicked() {
     let registry = DocRegistry::new();
-    let doc_id = "room-3";
-    registry.open(doc_id);
+    let doc_id = DocId::from("room-3");
+    registry.open(&doc_id);
 
     // 손상된 v1 바이트 → Err(Codec) 구체 변종, 패닉 금지.
-    let err = registry.apply_v1(doc_id, &[0xff, 0xff, 0xff]).unwrap_err();
+    let err = registry.apply_v1(&doc_id, &[0xff, 0xff, 0xff]).unwrap_err();
     assert!(
         matches!(err, EngineError::Codec(_)),
         "expected Codec, got {err:?}"
