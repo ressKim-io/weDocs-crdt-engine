@@ -2174,6 +2174,7 @@ dependencies = [
  "proptest",
  "prost",
  "protoc-bin-vendored",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tonic",

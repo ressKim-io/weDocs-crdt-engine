@@ -4,7 +4,6 @@
 //! 모든 인코딩은 lib0 **v1**(Yjs 호환) 고정 — v2 사용 시 브라우저 클라가 디코드 불가.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, broadcast};
@@ -18,24 +17,15 @@ use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 const FANOUT_CAPACITY: usize = 256;
 
 /// 엔진 경계 에러. yrs 내부 에러 타입을 메시지로 흡수해 상위(tonic)에서 `Status`로 매핑.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     /// 스트림이 열리기 전(open 미경유)에 도달한 논리 오류.
+    #[error("unknown doc: {0}")]
     UnknownDoc(String),
     /// v1 update/state-vector 디코드 또는 머지 실패(손상된 프레임).
+    #[error("v1 codec error: {0}")]
     Codec(String),
 }
-
-impl fmt::Display for EngineError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EngineError::UnknownDoc(id) => write!(f, "unknown doc: {id}"),
-            EngineError::Codec(msg) => write!(f, "v1 codec error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for EngineError {}
 
 /// docId 하나의 권위 상태: yrs `Doc` + 구독자 broadcast.
 struct DocEntry {

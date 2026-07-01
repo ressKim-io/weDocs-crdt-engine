@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 yrs = "0.27"
+thiserror = "2"
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 prost = "0.14"
