@@ -18,7 +18,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::common::DocRef;
 use crate::crdt::crdt_engine_server::CrdtEngine;
 use crate::crdt::{ClientFrame, ServerFrame, Snapshot};
-use crate::engine::DocRegistry;
+use crate::engine::{DocId, DocRegistry};
 
 /// 엔진 → 클라이언트 서버 스트림 타입(bidi `Sync`의 응답 측).
 type ServerFrameStream = Pin<Box<dyn Stream<Item = Result<ServerFrame, Status>> + Send>>;
@@ -82,7 +82,7 @@ impl CrdtEngine for CrdtEngineService {
             .metadata()
             .get("doc-id")
             .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
+            .map(DocId::from)
             .ok_or_else(|| Status::invalid_argument("missing doc-id metadata"))?;
 
         let span = tracing::info_span!("crdt.sync", doc_id = %doc_id);
@@ -93,7 +93,7 @@ impl CrdtEngine for CrdtEngineService {
 
         let mut inbound = request.into_inner();
         let registry = self.registry.clone();
-        let subscription = registry.open(&doc_id).await;
+        let subscription = registry.open(&doc_id);
         let mut fanout = subscription.receiver;
 
         let (out_tx, out_rx) = mpsc::channel::<Result<ServerFrame, Status>>(OUTBOUND_BUFFER);
@@ -143,22 +143,26 @@ impl CrdtEngine for CrdtEngineService {
 
     /// 스냅샷 조회(복원/디버그용) — 전체 상태를 v1로 인코드. 없는 doc는 빈 바이트.
     async fn get_snapshot(&self, request: Request<DocRef>) -> Result<Response<Snapshot>, Status> {
-        let doc_id = request.into_inner().doc_id;
-        let data = self.registry.full_state_v1(&doc_id).await;
-        Ok(Response::new(Snapshot { doc_id, data }))
+        let doc_id = DocId::from(request.into_inner().doc_id);
+        let data = self.registry.full_state_v1(&doc_id);
+        Ok(Response::new(Snapshot {
+            doc_id: doc_id.into_inner(),
+            data,
+        }))
     }
 }
 
 /// 인바운드 ClientFrame 한 개 처리. `false` 반환 시 세션 종료.
 async fn handle_inbound(
     registry: &DocRegistry,
-    doc_id: &str,
+    doc_id: &DocId,
     frame: ClientFrame,
     out_tx: &Outbound,
 ) -> bool {
     // §D-1: 메타데이터 room과 프레임 doc_id 불일치 = 게이트웨이 오라우팅 →
     // 엉뚱한 doc 교차오염 방지 위해 세션 종료(소프트 무시 아님).
-    if !frame.doc_id.is_empty() && frame.doc_id != doc_id {
+    // frame.doc_id는 prost 생성 String(변경 불가) → DocId를 &str로 비교.
+    if !frame.doc_id.is_empty() && frame.doc_id != doc_id.as_str() {
         let _ = out_tx
             .send(Err(Status::invalid_argument(format!(
                 "doc_id mismatch: stream={doc_id}, frame={}",
@@ -170,7 +174,7 @@ async fn handle_inbound(
 
     // 클라 SyncStep1 → SyncStep2 diff(late-join 핵심). 손상 SV는 그 프레임만 무시(update와 대칭).
     if !frame.state_vector.is_empty() {
-        match registry.diff_v1(doc_id, &frame.state_vector).await {
+        match registry.diff_v1(doc_id, &frame.state_vector) {
             Ok(diff) => {
                 let reply = ServerFrame {
                     update: diff,
@@ -186,7 +190,7 @@ async fn handle_inbound(
 
     // 클라 update → 머지 + broadcast. 손상 프레임은 로그만, 스트림/타 클라 유지.
     if !frame.update.is_empty()
-        && let Err(e) = registry.apply_v1(doc_id, &frame.update).await
+        && let Err(e) = registry.apply_v1(doc_id, &frame.update)
     {
         tracing::warn!(%doc_id, error = %e, "apply_v1 failed");
     }
@@ -197,7 +201,7 @@ async fn handle_inbound(
 /// broadcast 수신 한 개를 아웃바운드로 중계. `false` 반환 시 세션 종료.
 async fn handle_broadcast(
     registry: &DocRegistry,
-    doc_id: &str,
+    doc_id: &DocId,
     received: Result<Vec<u8>, RecvError>,
     out_tx: &Outbound,
 ) -> bool {
@@ -213,7 +217,7 @@ async fn handle_broadcast(
         Err(RecvError::Lagged(skipped)) => {
             // TODO(M1.5): lagged 빈발 시 cap 부족 신호 → metric(lagged_total)
             tracing::warn!(%doc_id, skipped, "fan-out lagged; resyncing");
-            let full = registry.full_state_v1(doc_id).await;
+            let full = registry.full_state_v1(doc_id);
             let frame = ServerFrame {
                 update: full,
                 state_vector: Vec::new(),
@@ -232,6 +236,7 @@ mod tests {
     #[tokio::test]
     async fn inbound_rejects_doc_id_mismatch() {
         let registry = DocRegistry::new();
+        let doc_id = DocId::from("room-1");
         let (tx, mut rx) = mpsc::channel(4);
         let frame = ClientFrame {
             doc_id: "other-room".into(),
@@ -239,7 +244,7 @@ mod tests {
             state_vector: Vec::new(),
         };
 
-        let keep = handle_inbound(&registry, "room-1", frame, &tx).await;
+        let keep = handle_inbound(&registry, &doc_id, frame, &tx).await;
 
         assert!(!keep, "mismatch must end session");
         match rx.recv().await {
@@ -252,7 +257,8 @@ mod tests {
     #[tokio::test]
     async fn inbound_accepts_empty_doc_id() {
         let registry = DocRegistry::new();
-        registry.open("room-1").await;
+        let doc_id = DocId::from("room-1");
+        registry.open(&doc_id);
         let (tx, _rx) = mpsc::channel(4);
         let frame = ClientFrame {
             doc_id: String::new(),
@@ -260,6 +266,6 @@ mod tests {
             state_vector: Vec::new(),
         };
 
-        assert!(handle_inbound(&registry, "room-1", frame, &tx).await);
+        assert!(handle_inbound(&registry, &doc_id, frame, &tx).await);
     }
 }
