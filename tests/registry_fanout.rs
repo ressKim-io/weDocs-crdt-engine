@@ -29,12 +29,12 @@ async fn fanout_delivers_update_to_all_subscribers() {
     let doc_id = "room-1";
 
     // 두 세션(두 브라우저) open → 각자 구독.
-    let mut a = registry.open(doc_id).await;
-    let mut b = registry.open(doc_id).await;
+    let mut a = registry.open(doc_id);
+    let mut b = registry.open(doc_id);
 
     // 세션 A가 'x' update 전송 → 머지 + broadcast.
     let ux = insert_update('x');
-    registry.apply_v1(doc_id, &ux).await.unwrap();
+    registry.apply_v1(doc_id, &ux).unwrap();
 
     // 양쪽 수신기 모두 동일 바이트 수신(self-echo 포함, §D-3).
     assert_eq!(a.receiver.recv().await.unwrap(), ux);
@@ -45,16 +45,13 @@ async fn fanout_delivers_update_to_all_subscribers() {
 async fn diff_returns_full_state_for_empty_state_vector() {
     let registry = DocRegistry::new();
     let doc_id = "room-2";
-    registry.open(doc_id).await;
+    registry.open(doc_id);
 
-    registry
-        .apply_v1(doc_id, &insert_update('y'))
-        .await
-        .unwrap();
+    registry.apply_v1(doc_id, &insert_update('y')).unwrap();
 
     // 빈 state vector → 전체 상태 diff. 적용 시 'y' 복원.
     let empty_sv = StateVector::default().encode_v1();
-    let snapshot = registry.diff_v1(doc_id, &empty_sv).await.unwrap();
+    let snapshot = registry.diff_v1(doc_id, &empty_sv).unwrap();
     assert_eq!(text_of(&snapshot), "y");
 }
 
@@ -62,13 +59,10 @@ async fn diff_returns_full_state_for_empty_state_vector() {
 async fn corrupt_update_is_rejected_not_panicked() {
     let registry = DocRegistry::new();
     let doc_id = "room-3";
-    registry.open(doc_id).await;
+    registry.open(doc_id);
 
     // 손상된 v1 바이트 → Err(Codec) 구체 변종, 패닉 금지.
-    let err = registry
-        .apply_v1(doc_id, &[0xff, 0xff, 0xff])
-        .await
-        .unwrap_err();
+    let err = registry.apply_v1(doc_id, &[0xff, 0xff, 0xff]).unwrap_err();
     assert!(
         matches!(err, EngineError::Codec(_)),
         "expected Codec, got {err:?}"

@@ -93,7 +93,7 @@ impl CrdtEngine for CrdtEngineService {
 
         let mut inbound = request.into_inner();
         let registry = self.registry.clone();
-        let subscription = registry.open(&doc_id).await;
+        let subscription = registry.open(&doc_id);
         let mut fanout = subscription.receiver;
 
         let (out_tx, out_rx) = mpsc::channel::<Result<ServerFrame, Status>>(OUTBOUND_BUFFER);
@@ -144,7 +144,7 @@ impl CrdtEngine for CrdtEngineService {
     /// 스냅샷 조회(복원/디버그용) — 전체 상태를 v1로 인코드. 없는 doc는 빈 바이트.
     async fn get_snapshot(&self, request: Request<DocRef>) -> Result<Response<Snapshot>, Status> {
         let doc_id = request.into_inner().doc_id;
-        let data = self.registry.full_state_v1(&doc_id).await;
+        let data = self.registry.full_state_v1(&doc_id);
         Ok(Response::new(Snapshot { doc_id, data }))
     }
 }
@@ -170,7 +170,7 @@ async fn handle_inbound(
 
     // 클라 SyncStep1 → SyncStep2 diff(late-join 핵심). 손상 SV는 그 프레임만 무시(update와 대칭).
     if !frame.state_vector.is_empty() {
-        match registry.diff_v1(doc_id, &frame.state_vector).await {
+        match registry.diff_v1(doc_id, &frame.state_vector) {
             Ok(diff) => {
                 let reply = ServerFrame {
                     update: diff,
@@ -186,7 +186,7 @@ async fn handle_inbound(
 
     // 클라 update → 머지 + broadcast. 손상 프레임은 로그만, 스트림/타 클라 유지.
     if !frame.update.is_empty()
-        && let Err(e) = registry.apply_v1(doc_id, &frame.update).await
+        && let Err(e) = registry.apply_v1(doc_id, &frame.update)
     {
         tracing::warn!(%doc_id, error = %e, "apply_v1 failed");
     }
@@ -213,7 +213,7 @@ async fn handle_broadcast(
         Err(RecvError::Lagged(skipped)) => {
             // TODO(M1.5): lagged 빈발 시 cap 부족 신호 → metric(lagged_total)
             tracing::warn!(%doc_id, skipped, "fan-out lagged; resyncing");
-            let full = registry.full_state_v1(doc_id).await;
+            let full = registry.full_state_v1(doc_id);
             let frame = ServerFrame {
                 update: full,
                 state_vector: Vec::new(),
@@ -252,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn inbound_accepts_empty_doc_id() {
         let registry = DocRegistry::new();
-        registry.open("room-1").await;
+        registry.open("room-1");
         let (tx, _rx) = mpsc::channel(4);
         let frame = ClientFrame {
             doc_id: String::new(),
