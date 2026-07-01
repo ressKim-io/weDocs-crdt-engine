@@ -6,6 +6,7 @@
 use std::pin::Pin;
 
 use opentelemetry::propagation::Extractor;
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
@@ -71,19 +72,8 @@ impl CrdtEngine for CrdtEngineService {
         &self,
         request: Request<Streaming<ClientFrame>>,
     ) -> Result<Response<Self::SyncStream>, Status> {
-        // 게이트웨이(Java javaagent)가 gRPC 메타데이터에 주입한 W3C traceparent를 추출(가드레일 4).
-        // bidi 스트림이라 stream-open 1회 전파 — 이 세션 전체가 게이트웨이 span의 자식.
-        // (per-edit 메시지 span은 proto field/수동 전파 필요 → M1.5/M5.)
-        let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.extract(&MetadataExtractor(request.metadata()))
-        });
-
-        let doc_id = request
-            .metadata()
-            .get("doc-id")
-            .and_then(|v| v.to_str().ok())
-            .map(DocId::from)
-            .ok_or_else(|| Status::invalid_argument("missing doc-id metadata"))?;
+        let parent_cx = extract_trace_context(request.metadata());
+        let doc_id = extract_doc_id(request.metadata())?;
 
         let span = tracing::info_span!("crdt.sync", doc_id = %doc_id);
         // OTel 레이어 부재(degraded/test)면 Err — trace 연결만 생략, 세션은 정상.
@@ -91,50 +81,22 @@ impl CrdtEngine for CrdtEngineService {
             tracing::debug!(error = %error, "trace parent 미설정(OTel 레이어 부재)");
         }
 
-        let mut inbound = request.into_inner();
+        let inbound = request.into_inner();
         let registry = self.registry.clone();
         let subscription = registry.open(&doc_id);
-        let mut fanout = subscription.receiver;
 
         let (out_tx, out_rx) = mpsc::channel::<Result<ServerFrame, Status>>(OUTBOUND_BUFFER);
 
         // `.instrument(span)` — 세션 태스크 전체를 trace span으로 감싸 내부 로그가 trace에 연결.
         tokio::spawn(
-            async move {
-                // 엔진 → 클라 SyncStep1: 클라가 가진 오프라인분을 pull하게 한다.
-                let step1 = ServerFrame {
-                    update: Vec::new(),
-                    state_vector: subscription.state_vector,
-                };
-                if out_tx.send(Ok(step1)).await.is_err() {
-                    return;
-                }
-
-                // cancel-safety: `inbound.message()`의 디코드 상태는 `Streaming`에 보존되고
-                // broadcast `recv()`는 문서상 cancel-safe → 어느 select 브랜치가 취소돼도 프레임 무손실.
-                // (config-contract-audit: tonic 마이너 업그레이드 시 재확인.)
-                loop {
-                    tokio::select! {
-                        incoming = inbound.message() => match incoming {
-                            Ok(Some(frame)) => {
-                                if !handle_inbound(&registry, &doc_id, frame, &out_tx).await {
-                                    break;
-                                }
-                            }
-                            Ok(None) => break, // 클라 정상 종료
-                            Err(status) => {
-                                tracing::warn!(%doc_id, %status, "inbound stream error");
-                                break;
-                            }
-                        },
-                        received = fanout.recv() => {
-                            if !handle_broadcast(&registry, &doc_id, received, &out_tx).await {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            run_session(
+                registry,
+                doc_id,
+                inbound,
+                subscription.receiver,
+                out_tx,
+                subscription.state_vector,
+            )
             .instrument(span),
         );
 
@@ -149,6 +111,69 @@ impl CrdtEngine for CrdtEngineService {
             doc_id: doc_id.into_inner(),
             data,
         }))
+    }
+}
+
+/// 게이트웨이(Java javaagent)가 gRPC 메타데이터에 주입한 W3C traceparent를 추출(가드레일 4).
+/// bidi 스트림이라 stream-open 1회 전파 — 이 세션 전체가 게이트웨이 span의 자식.
+/// (per-edit 메시지 span은 proto field/수동 전파 필요 → M1.5/M5.)
+fn extract_trace_context(metadata: &MetadataMap) -> opentelemetry::Context {
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&MetadataExtractor(metadata))
+    })
+}
+
+/// gRPC 메타데이터 `doc-id`에서 DocId를 추출(§D-1).
+fn extract_doc_id(metadata: &MetadataMap) -> Result<DocId, Status> {
+    metadata
+        .get("doc-id")
+        .and_then(|v| v.to_str().ok())
+        .map(DocId::from)
+        .ok_or_else(|| Status::invalid_argument("missing doc-id metadata"))
+}
+
+/// 세션 루프: SyncStep1 전송 후 inbound/fan-out을 `select`로 처리하다 종료 조건에서 반환.
+///
+/// cancel-safety: `inbound.message()`의 디코드 상태는 `Streaming`에 보존되고
+/// broadcast `recv()`는 문서상 cancel-safe → 어느 select 브랜치가 취소돼도 프레임 무손실.
+/// (config-contract-audit: tonic 마이너 업그레이드 시 재확인.)
+async fn run_session(
+    registry: DocRegistry,
+    doc_id: DocId,
+    mut inbound: Streaming<ClientFrame>,
+    mut fanout: broadcast::Receiver<Vec<u8>>,
+    out_tx: Outbound,
+    state_vector: Vec<u8>,
+) {
+    // 엔진 → 클라 SyncStep1: 클라가 가진 오프라인분을 pull하게 한다.
+    let step1 = ServerFrame {
+        update: Vec::new(),
+        state_vector,
+    };
+    if out_tx.send(Ok(step1)).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            incoming = inbound.message() => match incoming {
+                Ok(Some(frame)) => {
+                    if !handle_inbound(&registry, &doc_id, frame, &out_tx).await {
+                        break;
+                    }
+                }
+                Ok(None) => break, // 클라 정상 종료
+                Err(status) => {
+                    tracing::warn!(%doc_id, %status, "inbound stream error");
+                    break;
+                }
+            },
+            received = fanout.recv() => {
+                if !handle_broadcast(&registry, &doc_id, received, &out_tx).await {
+                    break;
+                }
+            }
+        }
     }
 }
 
